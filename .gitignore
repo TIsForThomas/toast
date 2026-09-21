@@ -1,0 +1,15 @@
+# Never commit a capture or a built medium: a capture is a copy of somebody's
+# computer, and the images are gigabytes.
+home/partimag/
+build/cz/
+build/*.img
+build/*.iso
+build/*.zip
+build/iso-stage/
+build/toast-bg.png
+build/brand/
+test/test-runs/
+test/weekend-runs/
+*.log
+__pycache__/
+*.pyc

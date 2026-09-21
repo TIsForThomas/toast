@@ -1,0 +1,13 @@
+# Patterns that must never appear in a file that ships to a customer.
+#
+# Every build path (build-kit.sh, build-kit-iso.sh, write-kit) greps the two
+# Windows payload files against this list and REFUSES TO BUILD on a hit, and
+# test-toast.sh re-checks the finished ISO. A shipping gate, not a warning:
+# these two files go to a customer and their comments ship with them.
+#
+# One extended-regex alternative per line. Blank lines and # comments ignored.
+# Add your own build server's hostname, shares and mount points here.
+\\\\[A-Za-z0-9._-]+\\
+10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}
+192\.168\.[0-9]{1,3}\.[0-9]{1,3}
+172\.(1[6-9]|2[0-9]|3[01])\.[0-9]{1,3}\.[0-9]{1,3}

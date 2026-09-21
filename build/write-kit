@@ -1,0 +1,318 @@
+#!/bin/bash
+# write-kit - build a TOAST Image Capture Kit USB, standardized and verified.
+#
+# WHY THIS IS NOT `dd if=kit.img`
+# kit.img is a 3.1 GB master with a 2.9 GB FAT32 partition. That is fine for
+# booting and was what the QEMU tests used, but it CANNOT HOLD A REAL CAPTURE:
+# only ~2.4 GB is free, and a customer's Windows image is tens of GB. dd'ing the
+# master to a 256 GB stick would leave 253 GB unreachable behind the small
+# partition. So this builds the stick at the device's real size instead, using
+# the same components and the same verified boot recipe as build-kit.sh.
+#
+# Every stick this produces is identical apart from its size. Nothing
+# customer-specific is baked in at write time: no company name, no return
+# address, no per-kit anything. A stick becomes specific to a customer only by
+# being run. That is a deliberate rule, not an omission.
+#
+# Usage:
+#   sudo write-kit /dev/sdX              write a real USB device
+#   sudo write-kit --image out.img --size 256G   build an image for QEMU testing
+#   sudo write-kit /dev/sdX --yes        skip the typed confirmation (scripted use)
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+CZ="$HERE/cz"
+KIT="$HERE/../kit/TOAST"
+MNT=$(mktemp -d /tmp/write-kit.XXXXXX)
+LOOP=""
+TARGET=""
+IMAGE=""
+IMGSIZE=""
+ASSUME_YES=no
+MIN_BYTES=$((32 * 1000 * 1000 * 1000))   # below this a stick cannot hold a capture
+
+# Payload listed explicitly, never by wildcard: the source folders also hold
+# .bak_* revert copies, and a stale ocs-prerun.sh.bak on a customer's stick would
+# be a confusing thing for a support call to find.
+#
+# TWO SOURCES, on purpose (2026-09-04). The Windows half is maintained in
+# its own windows/ tree and is read straight from there. It used to be
+# generated into kit/TOAST/ by a splicing script whose own source was later
+# retired, and the copy on the stick silently fell 754 lines behind the real one
+# while still building cleanly. Reading the live file is what makes that
+# impossible.
+KIT_TOP=( KIT-VERSION.txt START-HERE.md )
+KIT_SCRIPTS=( ocs-common.sh ocs-prerun.sh ocs-capture.sh ocs-shrink.sh ocs-deploy.sh ocs-repair.sh ocs-preflight.sh )
+KIT_PAYLOAD=( "${KIT_TOP[@]}" "${KIT_SCRIPTS[@]}" )
+WINDOWS_SRC=${WINDOWS_SRC:-$HERE/../windows}
+WIN_TOP=( Run-Toast-Prep.cmd )
+WIN_SCRIPTS=( Prepare-Sysprep-USB.ps1 )
+WIN_PAYLOAD=( "${WIN_TOP[@]}" "${WIN_SCRIPTS[@]}" )
+# Shipping gate: anything that must not appear in a file a customer receives,
+# comments included. One place, loaded from build/leak-patterns.txt, so the list
+# of internal names never lives inside a file that ships.
+LEAK_PATTERNS=${LEAK_PATTERNS:-"$HERE/leak-patterns.txt"}
+LEAK_RE=$(grep -vE '^[[:space:]]*(#|$)' "$LEAK_PATTERNS" | paste -sd'|')
+[ -n "$LEAK_RE" ] || { echo "no leak patterns loaded from $LEAK_PATTERNS" >&2; exit 1; }
+
+cleanup() {
+    mountpoint -q "$MNT" && umount "$MNT" 2>/dev/null || true
+    [ -n "$LOOP" ] && losetup -d "$LOOP" 2>/dev/null || true
+    rmdir "$MNT" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+die() { echo "write-kit: $*" >&2; exit 1; }
+say() { echo "==> $*"; }
+
+# --- arguments ---------------------------------------------------------------
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --image) IMAGE="${2:?--image needs a path}"; shift 2 ;;
+        --size)  IMGSIZE="${2:?--size needs a size}"; shift 2 ;;
+        --yes)   ASSUME_YES=yes; shift ;;
+        -*)      die "unknown option $1" ;;
+        *)       TARGET="$1"; shift ;;
+    esac
+done
+
+[ "$(id -u)" = 0 ] || die "must run as root (use sudo)."
+[ -d "$CZ/live" ] || die "Clonezilla tree not found at $CZ. Run this from the build directory."
+[ -d "$KIT" ]     || die "kit payload not found at $KIT."
+for f in "${KIT_PAYLOAD[@]}"; do
+    [ -f "$KIT/$f" ] || die "missing payload file: $f"
+done
+[ -d "$WINDOWS_SRC" ] || die "Windows payload source not found at $WINDOWS_SRC."
+for f in "${WIN_PAYLOAD[@]}"; do
+    [ -s "$WINDOWS_SRC/$f" ] || die "missing Windows payload: $WINDOWS_SRC/$f"
+    # SHIPPING GATE: refuse to write a stick whose customer-facing files name an
+    # internal share or server. The retired generated wizard carried exactly such
+    # a comment, naming an internal build share by name.
+    if grep -qE "$LEAK_RE" "$WINDOWS_SRC/$f"; then
+        echo "write-kit: REFUSING - $f contains an internal path or address:" >&2
+        grep -nE "$LEAK_RE" "$WINDOWS_SRC/$f" >&2
+        exit 1
+    fi
+done
+[ -f "$HERE/grub.cfg.new" ] && [ -f "$HERE/syslinux.cfg.new" ] \
+    || die "grub.cfg.new / syslinux.cfg.new missing. Run: python3 patch_grub.py && python3 patch_syslinux.py"
+[ -f "$CZ/utils/mbr/mbr.bin" ] || die "Clonezilla mbr.bin not found."
+[ -x "$CZ/utils/linux/x64/syslinux" ] || die "Clonezilla's own syslinux installer not found."
+
+# --- resolve the target ------------------------------------------------------
+if [ -n "$IMAGE" ]; then
+    [ -n "$IMGSIZE" ] || die "--image also needs --size (e.g. --size 256G)."
+    [ -z "$TARGET" ]  || die "give either a device or --image, not both."
+    say "creating sparse image $IMAGE of $IMGSIZE"
+    rm -f "$IMAGE"
+    truncate -s "$IMGSIZE" "$IMAGE"
+    # This runs as root, so the image would be root-owned and unusable by the
+    # QEMU test harness running as the normal user.
+    if [ -n "${SUDO_UID:-}" ]; then chown "$SUDO_UID:${SUDO_GID:-$SUDO_UID}" "$IMAGE"; fi
+    LOOP=$(losetup --show -f -P "$IMAGE")
+    DEV="$LOOP"
+    PART="${LOOP}p1"
+    DESC="image file $IMAGE"
+else
+    [ -n "$TARGET" ] || die "no target given. Usage: write-kit /dev/sdX"
+    [ -b "$TARGET" ] || die "$TARGET is not a block device."
+    name=$(basename "$(readlink -f "$TARGET")")
+    [ -d "/sys/block/$name" ] || die "$TARGET is a partition, not a whole disk. Give the disk, e.g. /dev/sdb not /dev/sdb1."
+
+    # A 256 GB USB SSD reports removable=0, so "removable" is the wrong test.
+    # The bus is the reliable one.
+    case "$(readlink -f "/sys/block/$name")" in
+        *usb*) : ;;
+        *) die "$TARGET does not sit on the USB bus. Refusing: this tool repartitions the whole device." ;;
+    esac
+
+    # Refuse anything this machine is actually running on. Every mounted
+    # filesystem, not a hand-kept list: a list goes stale the day someone adds
+    # a mount, and the failure mode is repartitioning the wrong disk.
+    protected=""
+    for mp in $(awk '$1 ~ /^\/dev\// {print $2}' /proc/mounts | sort -u); do
+        src=$(findmnt -no SOURCE --target "$mp" 2>/dev/null || true)
+        [ -n "$src" ] || continue
+        pk=$(lsblk -no PKNAME "$src" 2>/dev/null | head -1 || true)
+        [ -n "$pk" ] && protected="$protected $pk"
+        bn=$(basename "$(readlink -f "$src")" 2>/dev/null || true)
+        [ -n "$bn" ] && protected="$protected $bn"
+    done
+    # RAID members too: an array mounts as /dev/mdN, whose members are separate
+    # block devices that findmnt never names.
+    for m in $(awk '/^md/{for(i=5;i<=NF;i++){gsub(/\[[0-9]+\]/,"",$i); print $i}}' /proc/mdstat 2>/dev/null); do
+        protected="$protected ${m%%[0-9]*}"
+    done
+    for p in $protected; do
+        [ "$p" = "$name" ] && die "$TARGET is in use by this server (matched '$p'). Refusing."
+    done
+
+    # Nothing on it may be mounted.
+    if lsblk -no MOUNTPOINT "$TARGET" 2>/dev/null | grep -q .; then
+        echo "write-kit: $TARGET has mounted partitions:" >&2
+        lsblk -o NAME,SIZE,MOUNTPOINT "$TARGET" >&2
+        die "unmount them first."
+    fi
+
+    DEV="$TARGET"
+    PART="${TARGET}1"
+    [ -b "${TARGET}p1" ] 2>/dev/null && PART="${TARGET}p1" || true
+    model=$(lsblk -dno MODEL "$TARGET" 2>/dev/null | xargs || echo unknown)
+    serial=$(lsblk -dno SERIAL "$TARGET" 2>/dev/null | xargs || echo unknown)
+    DESC="$TARGET  $model  serial $serial"
+fi
+
+BYTES=$(blockdev --getsize64 "$DEV")
+GB=$(awk -v b="$BYTES" 'BEGIN{printf "%.1f", b/1e9}')
+
+[ "$BYTES" -ge "$MIN_BYTES" ] || die "$DESC is only ${GB} GB. A kit stick must be at least 32 GB or it cannot hold a capture."
+
+echo
+echo "==============================================================="
+echo " WRITE TOAST IMAGE CAPTURE KIT"
+echo "==============================================================="
+echo " Target : $DESC"
+echo " Size   : ${GB} GB"
+echo " Kit    : $(cat "$KIT/KIT-VERSION.txt" 2>/dev/null | tr -d '\r\n')"
+echo
+echo " EVERYTHING ON THIS DEVICE WILL BE DESTROYED."
+echo "==============================================================="
+if [ "$ASSUME_YES" != yes ]; then
+    printf ' Type ERASE to continue: '
+    read -r ans
+    [ "$ans" = ERASE ] || die "not confirmed, nothing was written."
+fi
+
+# --- partition ---------------------------------------------------------------
+say "partitioning"
+wipefs -a "$DEV" >/dev/null
+# One FAT32 partition filling the device, bootable, type 0x0c (FAT32 LBA), and
+# the same 'TGKT' disk signature mkkit.py stamps, so a stick is recognisable.
+# UEFI boots /EFI/boot/bootx64.efi from any FAT partition on a removable device,
+# so one partition serves both firmware paths - no separate ESP needed.
+sfdisk --quiet --wipe always --wipe-partitions always "$DEV" <<'EOSF'
+label: dos
+label-id: 0x544b4754
+start=2048, type=0c, bootable
+EOSF
+partprobe "$DEV" 2>/dev/null || true
+udevadm settle 2>/dev/null || true
+[ -b "$PART" ] || die "partition $PART did not appear."
+
+# Clonezilla's own 440-byte MBR boot code, which chainloads the active
+# partition. Without it a legacy-BIOS machine finds no boot code and reports
+# "no bootable device"; UEFI ignores it entirely, which is how its absence went
+# unnoticed once before (see mkkit.py).
+#
+# Written with python rather than dd purely so a wrong conv= can never clobber
+# the partition table that was just created 0x1BE bytes in.
+say "writing MBR boot code"
+python3 - "$DEV" "$CZ/utils/mbr/mbr.bin" <<'EOPY'
+import sys
+dev, mbr = sys.argv[1], sys.argv[2]
+code = open(mbr, 'rb').read()
+assert len(code) == 440, f"mbr.bin must be 440 bytes, got {len(code)}"
+with open(dev, 'r+b') as f:
+    f.seek(0)
+    f.write(code)
+    f.flush()
+EOPY
+
+# --- filesystem --------------------------------------------------------------
+# 32 KiB clusters (-s 64). The 2.9 GB master uses 4 KiB, which on a 256 GB stick
+# would mean ~62 million clusters and a ~250 MB FAT: legal FAT32, but far outside
+# the geometry Windows normally produces, and the customer's Windows MUST be able
+# to mount this stick to run the wizard and to upload the image. 32 KiB clusters
+# give ~7.8 million clusters and a ~30 MB FAT, which is the ordinary shape for a
+# large FAT32 volume.
+say "formatting FAT32 (32 KiB clusters)"
+mkfs.vfat -F 32 -s 64 -n TOAST "$PART" >/dev/null
+
+# --- populate ----------------------------------------------------------------
+say "copying Clonezilla boot files (~546 MB)"
+mount "$PART" "$MNT"
+for d in EFI boot live syslinux utils home; do
+    [ -d "$CZ/$d" ] || die "Clonezilla tree is missing $d"
+    cp -r "$CZ/$d" "$MNT/"
+done
+
+# TOAST wallpaper in place of Clonezilla's, in both boot paths.
+[ -r "$HERE/toast-bg.png" ] || bash "$HERE/make-background.sh" >/dev/null
+cp -f "$HERE/toast-bg.png" "$MNT/syslinux/ocswp.png"
+cp -f "$HERE/toast-bg.png" "$MNT/boot/grub/ocswp-grub2.png"
+
+say "copying TOAST payload"
+mkdir -p "$MNT/TOAST/config" "$MNT/TOAST/logs" "$MNT/TOAST/scripts" "$MNT/home/partimag"
+for f in "${KIT_TOP[@]}";     do cp "$KIT/$f" "$MNT/TOAST/"; done
+for f in "${KIT_SCRIPTS[@]}"; do cp "$KIT/$f" "$MNT/TOAST/scripts/"; done
+for f in "${WIN_TOP[@]}";     do cp "$WINDOWS_SRC/$f" "$MNT/TOAST/"; done
+for f in "${WIN_SCRIPTS[@]}"; do cp "$WINDOWS_SRC/$f" "$MNT/TOAST/scripts/"; done
+cp "$HERE/grub.cfg.new"     "$MNT/boot/grub/grub.cfg"
+cp "$HERE/syslinux.cfg.new" "$MNT/syslinux/syslinux.cfg"
+
+# A fresh stick must never carry state from a previous run: capture state, one
+# customer's answers, or another unit's image.
+rm -f "$MNT/TOAST/config/capture.done" "$MNT/TOAST/config/capture.conf" \
+      "$MNT/TOAST/config/unattend.xml" "$MNT/TOAST/config/shrink.state" \
+      "$MNT/TOAST/logs/"*.log 2>/dev/null || true
+
+sync
+umount "$MNT"
+
+# --- legacy BIOS bootloader --------------------------------------------------
+# ⛔ MUST use Clonezilla's OWN bundled installer (6.03), not the host's 6.04. The
+# installer replaces ldlinux.sys and ldlinux.c32 but leaves the other modules
+# (vesamenu/libcom32/libutil/menu/chain.c32) as Clonezilla's 6.03, and a 6.04
+# loader cannot load 6.03 modules: it boots as far as SYSLINUX and then loops on
+# "Undef symbol FAIL: x86_init_fpu / Failed to load libcom32.c32".
+say "installing syslinux 6.03 (Clonezilla's own build)"
+"$CZ/utils/linux/x64/syslinux" -d syslinux -f -i "$PART"
+
+# --- verify ------------------------------------------------------------------
+say "verifying"
+mount "$PART" "$MNT"
+fail=0
+
+check() {  # src, path-on-stick
+    a=$(sha256sum "$1" | cut -d' ' -f1)
+    b=$(sha256sum "$MNT/$2" 2>/dev/null | cut -d' ' -f1)
+    if [ "$a" != "$b" ]; then echo "  MISMATCH or MISSING: $2"; fail=1; fi
+}
+for f in "${KIT_TOP[@]}";     do check "$KIT/$f"          "TOAST/$f"; done
+for f in "${KIT_SCRIPTS[@]}"; do check "$KIT/$f"          "TOAST/scripts/$f"; done
+for f in "${WIN_TOP[@]}";     do check "$WINDOWS_SRC/$f" "TOAST/$f"; done
+for f in "${WIN_SCRIPTS[@]}"; do check "$WINDOWS_SRC/$f" "TOAST/scripts/$f"; done
+for f in EFI/boot/bootx64.efi EFI/boot/grubx64.efi boot/grub/grub.cfg \
+         live/vmlinuz live/initrd.img live/filesystem.squashfs \
+         syslinux/syslinux.cfg syslinux/ldlinux.sys syslinux/vesamenu.c32; do
+    [ -s "$MNT/$f" ] || { echo "  MISSING or empty: $f"; fail=1; }
+done
+[ -d "$MNT/home/partimag" ] || { echo "  MISSING: home/partimag"; fail=1; }
+
+# The whole reason this tool exists: prove the stick can actually hold a capture.
+freeb=$(df -B1 --output=avail "$MNT" | tail -1 | tr -d ' ')
+freegb=$(awk -v b="$freeb" 'BEGIN{printf "%.1f", b/1e9}')
+clusters=$(fsck.vfat -nv "$PART" 2>/dev/null | sed -n 's/.*[^0-9]\([0-9]\+\) data clusters.*/\1/p' | head -1 || true)
+
+umount "$MNT"
+
+boot_flag=$(sfdisk -d "$DEV" | grep -c 'bootable' || true)
+
+echo
+echo "==============================================================="
+if [ "$fail" = 0 ]; then
+    echo " KIT WRITTEN AND VERIFIED"
+else
+    echo " KIT WRITTEN BUT VERIFICATION FAILED - DO NOT SHIP THIS STICK"
+fi
+echo "==============================================================="
+echo " Target          : $DESC"
+echo " Device size     : ${GB} GB"
+echo " Free for images : ${freegb} GB"
+echo " FAT32 clusters  : ${clusters:-unknown} (32 KiB each)"
+echo " Bootable flag   : $([ "$boot_flag" -ge 1 ] && echo set || echo MISSING)"
+echo " Kit version     : $(cat "$KIT/KIT-VERSION.txt" 2>/dev/null | tr -d '\r\n')"
+echo " Payload files   : $(( ${#KIT_PAYLOAD[@]} + ${#WIN_PAYLOAD[@]} )) verified by sha256"
+echo " Windows half    : from $WINDOWS_SRC"
+echo "==============================================================="
+exit "$fail"
